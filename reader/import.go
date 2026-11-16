@@ -96,13 +96,13 @@ func resolveDeepVisited(obj core.PdfObject, res *resolver, visited map[int]core.
 		}
 		resolved, err := res.Resolve(ref.Num())
 		if err != nil {
-			return obj, nil // return unresolved on error
+			return nil, err
 		}
 		// Mark as visited before recursing (handles cycles).
 		visited[ref.Num()] = nil
 		result, err := resolveDeepVisited(resolved, res, visited)
 		if err != nil {
-			return resolved, nil
+			return nil, err
 		}
 		visited[ref.Num()] = result
 		return result, nil

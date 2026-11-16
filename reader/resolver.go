@@ -405,7 +405,7 @@ func decompressStreamWithLimit(data []byte, dict *core.PdfDictionary, maxBytes i
 	filters := extractFilters(filterObj)
 
 	result := data
-	for _, filter := range filters {
+	for i, filter := range filters {
 		var err error
 		switch filter {
 		case "FlateDecode":
@@ -421,13 +421,26 @@ func decompressStreamWithLimit(data []byte, dict *core.PdfDictionary, maxBytes i
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	// Apply predictor if specified in /DecodeParms.
-	decodeParms := dict.Get("DecodeParms")
-	if decodeParms != nil {
-		if parmsDict, ok := decodeParms.(*core.PdfDictionary); ok {
-			result, _ = applyPredictor(result, parmsDict)
+		if filter == "FlateDecode" {
+			parms := dict.Get("DecodeParms")
+			if array, ok := parms.(*core.PdfArray); ok {
+				if array.Len() != len(filters) {
+					return nil, fmt.Errorf("reader: DecodeParms length does not match Filter")
+				}
+				parms = array.At(i)
+			} else if parms != nil && len(filters) != 1 {
+				return nil, fmt.Errorf("reader: multiple filters require a DecodeParms array")
+			}
+			if parms != nil {
+				if parmsDict, ok := parms.(*core.PdfDictionary); ok {
+					result, err = applyPredictor(result, parmsDict)
+					if err != nil {
+						return nil, fmt.Errorf("reader: predictor: %w", err)
+					}
+				} else if _, ok := parms.(*core.PdfNull); !ok {
+					return nil, fmt.Errorf("reader: invalid DecodeParms")
+				}
+			}
 		}
 	}
 
@@ -441,8 +454,13 @@ func applyPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {
 	columns := 1
 
 	if p := parms.Get("Predictor"); p != nil {
-		if num, ok := p.(*core.PdfNumber); ok {
-			predictor = num.IntValue()
+		num, ok := p.(*core.PdfNumber)
+		if !ok {
+			return nil, fmt.Errorf("invalid Predictor")
+		}
+		predictor, ok = num.IntValueChecked()
+		if !ok || predictor < 1 {
+			return nil, fmt.Errorf("invalid Predictor")
 		}
 	}
 	if c := parms.Get("Columns"); c != nil {
@@ -454,14 +472,16 @@ func applyPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {
 	if predictor == 1 {
 		return data, nil // no prediction
 	}
+	if predictor == 2 {
+		return decodeTIFFPredictor(data, parms)
+	}
 
 	if predictor >= 10 && predictor <= 15 {
 		// PNG prediction: each row has a filter byte followed by `columns` data bytes.
 		return decodePNGPredictor(data, columns)
 	}
 
-	// TIFF predictor (2) or unknown — return as-is.
-	return data, nil
+	return nil, fmt.Errorf("unsupported Predictor %d", predictor)
 }
 
 // decodePNGPredictor reverses PNG row filtering.
