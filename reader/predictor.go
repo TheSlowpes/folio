@@ -9,6 +9,43 @@ import (
 	"github.com/carlos7ags/folio/core"
 )
 
+// validatePNGPredictor restricts decoding to the existing algorithm's supported
+// one-byte sample/left stride. Unsupported layouts must retain an error rather
+// than lose their DecodeParms and be written as incorrectly decoded pixels.
+func validatePNGPredictor(data []byte, parms *core.PdfDictionary) (int, error) {
+	values := map[string]int{"Colors": 1, "BitsPerComponent": 8, "Columns": 1}
+	for key := range values {
+		if obj := parms.Get(key); obj != nil {
+			num, ok := obj.(*core.PdfNumber)
+			if !ok {
+				return 0, fmt.Errorf("invalid PNG %s", key)
+			}
+			value, ok := num.IntValueChecked()
+			if !ok || value <= 0 {
+				return 0, fmt.Errorf("invalid PNG %s", key)
+			}
+			values[key] = value
+		}
+	}
+	if values["Colors"] != 1 || values["BitsPerComponent"] != 8 {
+		return 0, fmt.Errorf("unsupported PNG predictor layout: requires Colors 1 and BitsPerComponent 8")
+	}
+	columns := values["Columns"]
+	if columns == int(^uint(0)>>1) {
+		return 0, fmt.Errorf("PNG row size overflows")
+	}
+	rowSize := columns + 1
+	if len(data)%rowSize != 0 {
+		return 0, fmt.Errorf("truncated PNG predictor row")
+	}
+	for offset := 0; offset < len(data); offset += rowSize {
+		if data[offset] > 4 {
+			return 0, fmt.Errorf("unsupported PNG row filter %d", data[offset])
+		}
+	}
+	return columns, nil
+}
+
 // decodeTIFFPredictor reverses horizontal sample differences, modulo the
 // component depth. Rows are byte-aligned; padding bits are not samples.
 func decodeTIFFPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {

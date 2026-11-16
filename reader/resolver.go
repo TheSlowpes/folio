@@ -451,7 +451,6 @@ func decompressStreamWithLimit(data []byte, dict *core.PdfDictionary, maxBytes i
 // This is commonly used with FlateDecode in xref streams and image data.
 func applyPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {
 	predictor := 1
-	columns := 1
 
 	if p := parms.Get("Predictor"); p != nil {
 		num, ok := p.(*core.PdfNumber)
@@ -463,12 +462,6 @@ func applyPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {
 			return nil, fmt.Errorf("invalid Predictor")
 		}
 	}
-	if c := parms.Get("Columns"); c != nil {
-		if num, ok := c.(*core.PdfNumber); ok {
-			columns = num.IntValue()
-		}
-	}
-
 	if predictor == 1 {
 		return data, nil // no prediction
 	}
@@ -477,6 +470,10 @@ func applyPredictor(data []byte, parms *core.PdfDictionary) ([]byte, error) {
 	}
 
 	if predictor >= 10 && predictor <= 15 {
+		columns, err := validatePNGPredictor(data, parms)
+		if err != nil {
+			return nil, err
+		}
 		// PNG prediction: each row has a filter byte followed by `columns` data bytes.
 		return decodePNGPredictor(data, columns)
 	}
