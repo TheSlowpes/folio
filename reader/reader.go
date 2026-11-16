@@ -100,6 +100,10 @@ type ReadOptions struct {
 	Strictness   Strictness
 	MaxCache     int          // max cached objects (0 = default 10000)
 	MemoryLimits MemoryLimits // memory safety limits for decompression
+	// MaxPages bounds collected leaf pages. Zero uses 100,000; negative is invalid.
+	// Page trees also have a fixed maximum depth of 100 nodes and a traversal
+	// budget of MemoryLimits.MaxObjectCount, or 1,000,000 if that limit is disabled.
+	MaxPages int
 }
 
 // Parse reads and parses a PDF from a byte slice.
@@ -109,6 +113,9 @@ func Parse(data []byte) (*PdfReader, error) {
 
 // ParseWithOptions reads and parses a PDF with custom options.
 func ParseWithOptions(data []byte, opts ReadOptions) (*PdfReader, error) {
+	if opts.MaxPages < 0 {
+		return nil, fmt.Errorf("reader: MaxPages must not be negative")
+	}
 	if len(data) < 5 {
 		return nil, fmt.Errorf("reader: file too small")
 	}
@@ -178,7 +185,7 @@ func ParseWithOptions(data []byte, opts ReadOptions) (*PdfReader, error) {
 	r.catalog = catalog
 
 	// Parse the page tree.
-	if err := r.parsePageTree(); err != nil {
+	if err := r.parsePageTree(opts.MaxPages); err != nil {
 		return nil, err
 	}
 
@@ -365,7 +372,7 @@ func (r *PdfReader) ResolveObject(obj core.PdfObject) (core.PdfObject, error) {
 }
 
 // parsePageTree traverses the page tree and collects all leaf pages.
-func (r *PdfReader) parsePageTree() error {
+func (r *PdfReader) parsePageTree(maxPages int) error {
 	pagesRef := r.catalog.Get("Pages")
 	if pagesRef == nil {
 		return fmt.Errorf("reader: catalog has no /Pages entry")
@@ -374,13 +381,39 @@ func (r *PdfReader) parsePageTree() error {
 	if err != nil {
 		return fmt.Errorf("reader: resolve Pages: %w", err)
 	}
-	pagesDict, ok := pagesObj.(*core.PdfDictionary)
+	_, ok := pagesObj.(*core.PdfDictionary)
 	if !ok {
 		return fmt.Errorf("reader: /Pages is not a dictionary")
 	}
 
 	r.pages = nil
-	return r.collectPages(pagesDict, inherited{})
+	if maxPages == 0 {
+		maxPages = defaultMaxPages
+	}
+	maxNodes := r.resolver.mem.limits.effectiveMaxObjectCount()
+	if maxNodes < 0 {
+		maxNodes = defaultMaxObjectCount
+	}
+	walk := pageTreeWalk{
+		refs: make(map[int]bool), dicts: make(map[*core.PdfDictionary]bool),
+		remaining: maxNodes, maxPages: maxPages,
+	}
+	return r.collectPages(pagesRef, inherited{}, 1, &walk)
+}
+
+const (
+	defaultMaxPages  = 100_000
+	maxPageTreeDepth = 100
+)
+
+// pageTreeWalk is shared across all branches, not just the current ancestry.
+// Reference identities survive resolver cache eviction; dictionary identities
+// also detect repeated direct nodes.
+type pageTreeWalk struct {
+	refs      map[int]bool
+	dicts     map[*core.PdfDictionary]bool
+	remaining int
+	maxPages  int
 }
 
 // inherited carries inheritable page tree attributes down the tree.
@@ -394,7 +427,33 @@ type inherited struct {
 }
 
 // collectPages recursively collects leaf pages from the page tree.
-func (r *PdfReader) collectPages(node *core.PdfDictionary, inh inherited) error {
+func (r *PdfReader) collectPages(obj core.PdfObject, inh inherited, depth int, walk *pageTreeWalk) error {
+	if depth > maxPageTreeDepth {
+		return fmt.Errorf("reader: page tree depth exceeds limit %d", maxPageTreeDepth)
+	}
+	if walk.remaining == 0 {
+		return fmt.Errorf("reader: page tree node budget exceeded")
+	}
+	walk.remaining--
+	if ref, ok := obj.(*core.PdfIndirectReference); ok {
+		if walk.refs[ref.Num()] {
+			return fmt.Errorf("reader: page tree revisits object %d", ref.Num())
+		}
+		walk.refs[ref.Num()] = true
+	}
+	resolved, err := r.resolver.ResolveDeep(obj)
+	if err != nil {
+		return fmt.Errorf("reader: resolve page tree node: %w", err)
+	}
+	node, ok := resolved.(*core.PdfDictionary)
+	if !ok {
+		return nil // Preserve handling of non-dictionary Kids.
+	}
+	if walk.dicts[node] {
+		return fmt.Errorf("reader: page tree revisits dictionary")
+	}
+	walk.dicts[node] = true
+
 	// Update inheritable attributes from this node.
 	if mb := node.Get("MediaBox"); mb != nil {
 		if arr, ok := mb.(*core.PdfArray); ok {
@@ -418,6 +477,9 @@ func (r *PdfReader) collectPages(node *core.PdfDictionary, inh inherited) error 
 	typeObj := node.Get("Type")
 	if typeObj != nil {
 		if name, ok := typeObj.(*core.PdfName); ok && name.Value == "Page" {
+			if len(r.pages) >= walk.maxPages {
+				return fmt.Errorf("reader: page count exceeds limit %d", walk.maxPages)
+			}
 			// Leaf page.
 			page := r.buildPageInfo(node, inh)
 			r.pages = append(r.pages, page)
@@ -440,15 +502,7 @@ func (r *PdfReader) collectPages(node *core.PdfDictionary, inh inherited) error 
 	}
 
 	for _, kidRef := range kids.All() {
-		kidObj, err := r.resolver.ResolveDeep(kidRef)
-		if err != nil {
-			return fmt.Errorf("reader: resolve page kid: %w", err)
-		}
-		kidDict, ok := kidObj.(*core.PdfDictionary)
-		if !ok {
-			continue
-		}
-		if err := r.collectPages(kidDict, inh); err != nil {
+		if err := r.collectPages(kidRef, inh, depth+1, walk); err != nil {
 			return err
 		}
 	}
